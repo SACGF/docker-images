@@ -1,0 +1,104 @@
+name: Build & Publish Docker Images
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  detect-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      tools: ${{ steps.matrix.outputs.tools }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Detect changed tool directories
+        id: matrix
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Get changed files compared to main
+          CHANGED_FILES=$(git diff --name-only origin/main...HEAD)
+
+          # Extract top-level directories
+          CANDIDATES=$(echo "$CHANGED_FILES" \
+            | awk -F/ 'NF > 1 { print $1 }' \
+            | sort -u)
+
+          TOOLS=()
+
+          for dir in $CANDIDATES; do
+            if [[ -d "$dir" ]] && \
+              [[ -f "$dir/Dockerfile" ]] && \
+              [[ -f "$dir/image.env" ]]; then
+              TOOLS+=("$dir")
+            fi
+          done
+
+          if [ "${#TOOLS[@]}" -eq 0 ]; then
+            echo "tools=[]" >> "$GITHUB_OUTPUT"
+          else
+            TOOLS_JSON=$(printf '%s\n' "${TOOLS[@]}" | jq -R . | jq -s .)
+            echo "tools=$TOOLS_JSON" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.tools != '[]'
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        tool: ${{ fromJson(needs.detect-changes.outputs.tools) }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+
+      - name: Load image configuration
+        run: |
+          set -a
+          source ${{ matrix.tool }}/image.env
+          set +a
+
+          echo "IMAGE_NAME=${IMAGE_NAME}" >> $GITHUB_ENV
+          echo "REGISTRY=${REGISTRY:-ghcr.io}" >> $GITHUB_ENV
+          echo "IMAGE_TAG=${IMAGE_TAG}" >> $GITHUB_ENV
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
+        with:
+          images: |
+            ghcr.io/${GITHUB_REPOSITORY_OWNER}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=${{ env.IMAGE_TAG }}
+
+      - name: Login to GitHub container registry
+        if: github.ref == 'refs/heads/main'
+        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build (and optionally push)
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
+        with:
+          context: ${{ matrix.tool }}
+          file: ${{ matrix.tool }}/Dockerfile
+          push: ${{ github.ref == 'refs/heads/main' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
